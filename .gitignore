@@ -1,5 +1,7 @@
 /.idea
 /utilities
+/venv
 /shapefiles/HA00_AWC.tif
 /shapefiles/HA00_AWC.tfw
 /shapefiles/projected.*
+/shapefiles/RobinsonForest.*
