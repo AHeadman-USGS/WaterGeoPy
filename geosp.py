@@ -1,17 +1,19 @@
 from osgeo import ogr, gdal, osr
+import os
 import numpy as np
 import json
 import pycrs
-
+import pyproj
 
 
 class Shp:
     def __init__(self, path):
         self.path = path
         self.shp = ogr.Open(self.path)
-        self.prj = self.shp.GetLayer().GetSpatialRef().ExportToProj4()
+        self.prj = self.shp.GetLayer().GetSpatialRef()
+        self.prj4 = self.prj.ExportToProj4()
         self.feature = self.shp.GetLayer(0).GetFeature(0)
-        self.extent = feature.GetGeometryRef().GetEnvelope()
+        self.extent = self.feature.GetGeometryRef().GetEnvelope()
         self.x_cen, self.y_cen = self._centroid()
         self.daymet_x, self.daymet_y = self.daymet_proj()
 
@@ -24,14 +26,25 @@ class Shp:
 
     def daymet_proj(self):
         daymet_proj = pycrs.load.from_file("shapefiles//Daymet.prj")
-        transformer = pycrs.Transformer.from_crs(self.prj, daymet_proj.to_proj4())
+        transformer = pyproj.Transformer.from_crs(self.prj4, daymet_proj.to_proj4())
         return transformer.transform(self.x_cen, self.y_cen)
 
 
-raster_path = "shapefiles//HA00_AWC.tif"
-vector_path = "shapefiles//RobinsonForest.shp"
+class Raster:
+    def __init__(self, path):
+        self.path = path
+        self.data = gdal.Open(self.path)
+        self.band_1 = self.data.GetRasterBand(1)
+        self.gt = self.data.GetGeoTransform
+        self.prj = osr.SpatialReference(wkt=self.data.GetProjection())
+        self.prj4 = self.prj.ExportToProj4()
 
 
+# raster_path = "shapefiles//HA00_AWC.tif"
+# vector_path = "shapefiles//RobinsonForest.shp"
+#
+# raster = Raster(path = "shapefiles//HA00_AWC.tif")
+# shp = Shp(path="shapefiles//RobinsonForest.shp")
 
 def bbox_to_pixel_offsets(gt, bbox):
     originX = gt[0]
@@ -46,51 +59,55 @@ def bbox_to_pixel_offsets(gt, bbox):
 
     xsize = x2 - x1
     ysize = y2 - y1
-    return (x1, y1, xsize, ysize)
+    return x1, y1, xsize, ysize
 
 
+def zonal_stats(raster, shp):
 
-
-
-def zonal_stats(raster_path, vector_path):
-
-    r_data = gdal.Open(raster_path)
+    r_data = raster.data
     r_band = r_data.GetRasterBand(1)
-    r_geotransform = r_data.GetGeoTransform()
-    v_data = ogr.Open(vector_path)
+    r_geotransform = raster.gt()
+    v_data = shp.shp
     v_feature = v_data.GetLayer(0)
 
     sourceprj = v_feature.GetSpatialRef()
     targetprj = osr.SpatialReference(wkt=r_data.GetProjection())
-    to_fill = ogr.GetDriverByName("Esri Shapefile")
-    ds = to_fill.CreateDataSource("shapefiles//projected.shp")
-    outlayer = ds.CreateLayer('', targetprj, ogr.wkbPolygon)
-    outlayer.CreateField(ogr.FieldDefn('id', ogr.OFTInteger))
 
-    for feature in v_feature:
+
+    if sourceprj.ExportToProj4() != targetprj.ExportToProj4():
+        to_fill = ogr.GetDriverByName('Memory')
+        ds = to_fill.CreateDataSource("project")
+        outlayer = ds.CreateLayer('poly', targetprj, ogr.wkbPolygon)
+        feature = v_feature.GetFeature(0)
         transform = osr.CoordinateTransformation(sourceprj, targetprj)
         transformed = feature.GetGeometryRef()
         transformed.Transform(transform)
-
-
         geom = ogr.CreateGeometryFromWkb(transformed.ExportToWkb())
         defn = outlayer.GetLayerDefn()
         feat = ogr.Feature(defn)
-        feat.SetField('id', 0)
         feat.SetGeometry(geom)
-        outlayer.CreateFeature(feat)
+        outlayer.CreateFeature(feat.Clone())
         feat = None
 
-    ds = None
 
-    v_data = ogr.Open("shapefiles//projected.shp")
-    v_feature = v_data.GetLayer(0)
+        # for feature in v_feature:
+        #     transform = osr.CoordinateTransformation(sourceprj, targetprj)
+        #     transformed = feature.GetGeometryRef()
+        #     transformed.Transform(transform)
+        #     geom = ogr.CreateGeometryFromWkb(transformed.ExportToWkb())
+        #     defn = outlayer.GetLayerDefn()
+        #     feat = ogr.Feature(defn)
+        #     #feat.SetField('id', 0)
+        #     feat.SetGeometry(geom)
+        #     outlayer.CreateFeature(feat.Clone())
+        #     feat = None
+        # ds = None
+
+        v_feature = outlayer
 
 
     src_offset = bbox_to_pixel_offsets(r_geotransform, v_feature.GetExtent())
     src_array = r_band.ReadAsArray(*src_offset)
-
-
 
     new_gt = (
         (r_geotransform[0] + (src_offset[0] * r_geotransform[1])),
@@ -110,47 +127,33 @@ def zonal_stats(raster_path, vector_path):
     v_to_r_array = v_to_r.ReadAsArray()
     masked = np.ma.MaskedArray(
         src_array,
-        mask = np.logical_not(v_to_r_array)
+        mask=np.logical_not(v_to_r_array)
 
     )
 
     feature_stats = {
+        'source': str(raster.path),
         'min': float(masked.min()),
         'mean': float(masked.mean()),
         'max': float(masked.max()),
-        'std': float(masked.std()),
-        'sum': float(masked.sum()),
-        'count': int(masked.count())
+        'std': float(masked.std())
     }
 
+    ds = None
+
     stats.append(feature_stats)
+    return stats
 
 
+raster = Raster(path = "shapefiles//HA00_AWC.tif")
+shp = Shp(path="shapefiles//RobinsonForest.shp")
 
+# stats = []
+# for file in os.listdir("database"):
+#     if file.endswith(".tif"):
+#         raster = Raster(path="database//{}".format(file))
+#         zonal = zonal_stats(raster, shp)
+#         stats.append(zonal)
 
-
-
-
-
-
-check = Shp(path="shapefiles//RobinsonForest.shp")
-print(check.daymet_x)
-print(check.daymet_y)
-
-
-
-file = ogr.Open("shapefiles//RobinsonForest.shp")  ##
-feature = file.GetLayer(0).GetFeature(0)
-feature_json = feature.ExportToJson()
-extent = feature.GetGeometryRef().GetEnvelope()
-centoid = json.loads( ##
-    feature.GetGeometryRef().Centroid().ExportToJson()) ##
-
-cente_x = centroid['coordinates'][0] ##
-cente_y = centroid['coordinates'][1] ##
-prj = file.GetLayer().GetSpatialRef().ExportToProj4()  ##
-daymet_proj = pycrs.load.from_file("shapefiles//Daymet.prj") ##
-transformer = Transformer.from_crs(prj, daymet_proj.to_proj4())
-test = transformer.transform(center_x, center_y)
+test = zonal_stats(raster, shp)
 print(test)
-
