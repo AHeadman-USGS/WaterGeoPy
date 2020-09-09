@@ -1,6 +1,7 @@
 /.idea/*
 /utilities/*
 /venv/*
+/shapefiles/*
 /shapefiles/HA00_AWC.tif
 /shapefiles/HA00_AWC.tfw
 /shapefiles/projected.*
