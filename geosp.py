@@ -1,3 +1,5 @@
+
+
 from osgeo import ogr, gdal, osr
 import os
 import numpy as np
@@ -5,8 +7,18 @@ import json
 import pycrs
 import pyproj
 
+import time
+start_time = time.time()
 
 class Shp:
+    """
+    Contains various fuctions and metadata desc in init related in SHP objects.
+    While titled SHP, currently this should only be used with polygons.  Will incorporate fun things like
+    points in future versions.  I currently see no reason to incorporate lines.
+    Outside reliance on the daymet.prj (included in ./static/geospatial) to transform things into daymet to build the
+    temp/precip series.
+    """
+
     def __init__(self, path):
         self.path = path
         self.shp = ogr.Open(self.path)
@@ -31,6 +43,12 @@ class Shp:
 
 
 class Raster:
+    """
+       Contains various fuctions and metadata desc in init related in rasters objects.
+       WaterPy internals (./static/geospatal/rasters) utilizes tifs, this object class is compatible with any
+       osgeo/gdal compliant raster formats.
+    """
+
     def __init__(self, path):
         self.path = path
         self.data = gdal.Open(self.path)
@@ -40,22 +58,25 @@ class Raster:
         self.prj4 = self.prj.ExportToProj4()
 
 
-# raster_path = "shapefiles//HA00_AWC.tif"
-# vector_path = "shapefiles//RobinsonForest.shp"
-#
-# raster = Raster(path = "shapefiles//HA00_AWC.tif")
-# shp = Shp(path="shapefiles//RobinsonForest.shp")
-
 def bbox_to_pixel_offsets(gt, bbox):
-    originX = gt[0]
-    originY = gt[3]
+    """
+    Function to offset (aka snap) polygon to raster.
+
+
+    :param gt: geotransform variable from gdal.data.GetGeoTransform
+    :param bbox: Bounding extent coordinates from ogr.feature.GetExtent()
+    :return: tuple to use as a multiplier for the raster array.
+    """
+
+    origin_x = gt[0]
+    origin_y = gt[3]
     pixel_width = gt[1]
     pixel_height = gt[5]
-    x1 = int((bbox[0] - originX) / pixel_width)
-    x2 = int((bbox[1] - originX) / pixel_width) + 1
+    x1 = int((bbox[0] - origin_x) / pixel_width)
+    x2 = int((bbox[1] - origin_x) / pixel_width) + 1
 
-    y1 = int((bbox[3] - originY) / pixel_height)
-    y2 = int((bbox[2] - originY) / pixel_height) + 1
+    y1 = int((bbox[3] - origin_y) / pixel_height)
+    y2 = int((bbox[2] - origin_y) / pixel_height) + 1
 
     xsize = x2 - x1
     ysize = y2 - y1
@@ -63,6 +84,15 @@ def bbox_to_pixel_offsets(gt, bbox):
 
 
 def zonal_stats(raster, shp):
+    """
+    Converts a shp file into a raster mask.  Masks off a polygon and extracts statistics from the area within the mask.
+    Currently this only works with a shp file with one feature, however, it's written so that it could be adjusted to
+    handle multiple features.
+
+    :param raster: Raster class object.
+    :param shp: Shp class object.
+    :return: list of dict objects from computed stats.
+    """
 
     r_data = raster.data
     r_band = r_data.GetRasterBand(1)
@@ -72,7 +102,6 @@ def zonal_stats(raster, shp):
 
     sourceprj = v_feature.GetSpatialRef()
     targetprj = osr.SpatialReference(wkt=r_data.GetProjection())
-
 
     if sourceprj.ExportToProj4() != targetprj.ExportToProj4():
         to_fill = ogr.GetDriverByName('Memory')
@@ -88,23 +117,7 @@ def zonal_stats(raster, shp):
         feat.SetGeometry(geom)
         outlayer.CreateFeature(feat.Clone())
         feat = None
-
-
-        # for feature in v_feature:
-        #     transform = osr.CoordinateTransformation(sourceprj, targetprj)
-        #     transformed = feature.GetGeometryRef()
-        #     transformed.Transform(transform)
-        #     geom = ogr.CreateGeometryFromWkb(transformed.ExportToWkb())
-        #     defn = outlayer.GetLayerDefn()
-        #     feat = ogr.Feature(defn)
-        #     #feat.SetField('id', 0)
-        #     feat.SetGeometry(geom)
-        #     outlayer.CreateFeature(feat.Clone())
-        #     feat = None
-        # ds = None
-
         v_feature = outlayer
-
 
     src_offset = bbox_to_pixel_offsets(r_geotransform, v_feature.GetExtent())
     src_array = r_band.ReadAsArray(*src_offset)
@@ -115,7 +128,6 @@ def zonal_stats(raster, shp):
         (r_geotransform[3] + (src_offset[1] * r_geotransform[5])),
         0.0, r_geotransform[5]
     )
-
 
     driver = gdal.GetDriverByName('MEM')
 
@@ -145,15 +157,14 @@ def zonal_stats(raster, shp):
     return stats
 
 
-raster = Raster(path = "shapefiles//HA00_AWC.tif")
-shp = Shp(path="shapefiles//RobinsonForest.shp")
+shp = Shp(path="shapefiles//GrapeVine.shp")
 
-# stats = []
-# for file in os.listdir("database"):
-#     if file.endswith(".tif"):
-#         raster = Raster(path="database//{}".format(file))
-#         zonal = zonal_stats(raster, shp)
-#         stats.append(zonal)
+stats = []
+for file in os.listdir("database"):
+    if file.startswith("HA00") and file.endswith(".tif"):
+        raster = Raster(path="database//{}".format(file))
+        zonal = zonal_stats(raster, shp)
+        stats.append(zonal)
 
-test = zonal_stats(raster, shp)
-print(test)
+print(stats)
+print("--- %s seconds ---" % (time.time() - start_time))
