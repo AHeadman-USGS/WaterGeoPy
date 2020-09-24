@@ -1,12 +1,10 @@
 from osgeo import ogr, gdal, osr, gdalconst
 import os
 import numpy as np
+import pandas as pd
 import json
 import pycrs
 import pyproj
-
-import time
-start_time = time.time()
 
 
 class Shp:
@@ -41,7 +39,7 @@ class Shp:
                 lyr.DeleteField(i)
             else:
                 continue
-        ds.Destroy()
+        ds = None
         clean_shp = Shp(path=path)
         return clean_shp
 
@@ -60,7 +58,7 @@ class Shp:
 
 class dbShp:
     """
-    Basically the same as Raster class, for shapes provided with DB or created by code such as _karst and _karstclip
+    Basically the same as Raster class, for shapes provided with DB or created by code.
     shps.
     """
     def __init__(self, path):
@@ -69,10 +67,6 @@ class dbShp:
         self.lyr = self.shp.GetLayer()
         self.prj = self.shp.GetLayer().GetSpatialRef()
         self.prj4 = self.prj.ExportToProj4()
-        self.feature = None  # needs an assignment from outside the class.  Fine.
-        # self.extent = self.feature.GetGeometryRef().GetEnvelope()
-        # self.x_cen, self.y_cen = self._centroid()
-        # self.daymet_x, self.daymet_y = self.daymet_proj()
 
     def _centroid(self):
         centroid = json.loads(
@@ -125,6 +119,7 @@ def bbox_to_pixel_offsets(gt, bbox):
     xsize = x2 - x1
     ysize = y2 - y1
     return x1, y1, xsize, ysize
+
 
 def karst_detection(raster, shp):
     """
@@ -187,10 +182,86 @@ def karst_detection(raster, shp):
         return 0
 
 
-
-
-
 def zonal_stats(raster, shp):
+    """
+    Converts a shp file into a raster mask.  Masks off a polygon and extracts statistics from the area within the mask.
+    Currently this only works with a shp file with one feature, however, it's written so that it could be adjusted to
+    handle multiple features.
+
+    :param raster: Raster class object.
+    :param shp: Shp class object.
+    :return: list of dict objects from computed stats.
+    """
+
+    r_data = raster.data
+    r_band = r_data.GetRasterBand(1)
+    nodata_value = r_band.GetNoDataValue()
+    r_geotransform = raster.gt()
+    v_data = shp.shp
+    v_feature = v_data.GetLayer(0)
+
+    sourceprj = v_feature.GetSpatialRef()
+    targetprj = osr.SpatialReference(wkt=r_data.GetProjection())
+
+    if sourceprj.ExportToProj4() != targetprj.ExportToProj4():
+        to_fill = ogr.GetDriverByName('Memory')
+        ds = to_fill.CreateDataSource("project")
+        outlayer = ds.CreateLayer('poly', targetprj, ogr.wkbPolygon)
+        feature = v_feature.GetFeature(0)
+        transform = osr.CoordinateTransformation(sourceprj, targetprj)
+        transformed = feature.GetGeometryRef()
+        transformed.Transform(transform)
+        geom = ogr.CreateGeometryFromWkb(transformed.ExportToWkb())
+        defn = outlayer.GetLayerDefn()
+        feat = ogr.Feature(defn)
+        feat.SetGeometry(geom)
+        outlayer.CreateFeature(feat.Clone())
+        v_feature = outlayer
+
+    src_offset = bbox_to_pixel_offsets(r_geotransform, v_feature.GetExtent())
+    src_array = r_band.ReadAsArray(*src_offset)
+
+
+    new_gt = (
+        (r_geotransform[0] + (src_offset[0] * r_geotransform[1])),
+        r_geotransform[1], 0.0,
+        (r_geotransform[3] + (src_offset[1] * r_geotransform[5])),
+        0.0, r_geotransform[5]
+    )
+
+    driver = gdal.GetDriverByName('MEM')
+    stats = []
+
+    v_to_r = driver.Create('', src_offset[2], src_offset[3], 1, gdal.GDT_Byte)
+    v_to_r.SetGeoTransform(new_gt)
+    gdal.RasterizeLayer(v_to_r, [1], v_feature, burn_values=[1])
+    v_to_r_array = v_to_r.ReadAsArray()
+    src_array = np.array(src_array, dtype=float)
+    v_to_r_array = np.array(v_to_r.ReadAsArray(), dtype=float)
+    masked = np.ma.MaskedArray(
+        src_array,
+        mask=np.logical_or(
+            src_array == nodata_value,
+            np.logical_not(v_to_r_array)
+        ),
+        fill_value=np.nan
+    )
+
+    feature_stats = {
+        'source': str(raster.path),
+        'min': float(masked.min()),
+        'mean': float(masked.mean()),
+        'max': float(masked.max()),
+        'std': float(masked.std()),
+    }
+
+    ds = None
+
+    stats.append(feature_stats)
+    return feature_stats['mean']
+
+
+def zonal_area(raster, shp):
     """
     Converts a shp file into a raster mask.  Masks off a polygon and extracts statistics from the area within the mask.
     Currently this only works with a shp file with one feature, however, it's written so that it could be adjusted to
@@ -206,6 +277,7 @@ def zonal_stats(raster, shp):
     r_geotransform = raster.gt()
     v_data = shp.shp
     v_feature = v_data.GetLayer(0)
+    nodata_value = r_band.GetNoDataValue()
 
     sourceprj = v_feature.GetSpatialRef()
     targetprj = osr.SpatialReference(wkt=r_data.GetProjection())
@@ -244,24 +316,19 @@ def zonal_stats(raster, shp):
     v_to_r.SetGeoTransform(new_gt)
     gdal.RasterizeLayer(v_to_r, [1], v_feature, burn_values=[1])
     v_to_r_array = v_to_r.ReadAsArray()
+    src_array = np.array(src_array, dtype=float)
+    v_to_r_array = np.array(v_to_r.ReadAsArray(), dtype=float)
     masked = np.ma.MaskedArray(
         src_array,
-        mask=np.logical_not(v_to_r_array)
+        mask=np.logical_or(
+            src_array == nodata_value,
+            np.logical_not(v_to_r_array)
+        ),
+        fill_value=np.nan
 
     )
 
-    feature_stats = {
-        'source': str(raster.path),
-        'min': float(masked.min()),
-        'mean': float(masked.mean()),
-        'max': float(masked.max()),
-        'std': float(masked.std())
-    }
-
-    ds = None
-
-    stats.append(feature_stats)
-    return feature_stats
+    return float(masked.count() * 100)
 
 
 def twi_bins(raster, shp, nbins=30):
@@ -307,6 +374,8 @@ def twi_bins(raster, shp, nbins=30):
     v_to_r.SetGeoTransform(new_gt)
     gdal.RasterizeLayer(v_to_r, [1], v_feature, burn_values=[1])
     v_to_r_array = v_to_r.ReadAsArray()
+    src_array = np.array(src_array, dtype=float)
+    v_to_r_array = np.array(v_to_r.ReadAsArray(), dtype=float)
     masked = np.ma.MaskedArray(
         src_array,
         mask=np.logical_or(
@@ -331,7 +400,10 @@ def twi_bins(raster, shp, nbins=30):
     for i in range(nbins):
         line = []
         bin = i + 1
-        twi_val = histo[1][i]
+        if i == 0:
+            twi_val = histo[1][i] / 2
+        else:
+            twi_val = (histo[1][i] + histo[1][i-1]) / 2
         proportion = histo[0][i]/np.sum(histo[0])
 
         line.append(bin)
@@ -339,7 +411,35 @@ def twi_bins(raster, shp, nbins=30):
         line.append(proportion)
         bins.append(line)
 
-    return bins
+    df = pd.DataFrame(bins, columns=['bin', 'twi', 'proportion'])
+    df.set_index('bin', inplace=True)
+
+    return df
+
+
+def simplify(src):
+
+    driver = ogr.GetDriverByName("ESRI Shapefile")
+    src_ds = driver.Open(src.path, 0)
+    src_layer = src_ds.GetLayer()
+    out_path = src.path[:-4] + '_simple.shp'
+    srs = osr.SpatialReference()
+    srs.ImportFromProj4(src.prj4)
+    if os.path.exists(out_path):
+        driver.DeleteDataSource(out_path)
+
+    out_ds = driver.CreateDataSource(out_path)
+    out_layer = out_ds.CreateLayer('FINAL', srs=srs, geom_type=ogr.wkbPolygon)
+
+    infeature = src_layer.GetFeature(0)
+    outfeature = ogr.Feature(out_layer.GetLayerDefn())
+    geom = infeature.geometry().Simplify(100.0)
+    outfeature.SetGeometry(geom)
+    out_layer.CreateFeature(outfeature)
+    outfeature = None
+    out_ds = None
+    out_shp = dbShp(path=out_path)
+    return out_shp
 
 
 def clip(src, shp):
@@ -348,30 +448,52 @@ def clip(src, shp):
     :param shp: shapefile class with basin boundary.
     :return: shapefile output and class with karst.
     """
+
     driver = ogr.GetDriverByName("ESRI Shapefile")
     src_ds = driver.Open(src.path, 0)
     src_layer = src_ds.GetLayer()
-
     clip_ds = driver.Open(shp.path, 0)
     clip_layer = clip_ds.GetLayer()
+    clip_prj = clip_layer.GetSpatialRef()
+    src_prj = src_layer.GetSpatialRef()
+
+
+    if src.prj4 != shp.prj4:
+        to_fill = ogr.GetDriverByName('Memory')
+        ds = to_fill.CreateDataSource("project")
+        out_layer = ds.CreateLayer('poly', src_prj, ogr.wkbPolygon)
+        feature = shp.lyr.GetFeature(0)
+        transform = osr.CoordinateTransformation(clip_prj, src_prj)
+        transformed = feature.GetGeometryRef()
+        transformed.Transform(transform)
+        geom = ogr.CreateGeometryFromWkb(transformed.ExportToWkb())
+        defn = out_layer.GetLayerDefn()
+        feat = ogr.Feature(defn)
+        feat.SetGeometry(geom)
+        out_layer.CreateFeature(feat.Clone())
+        clip_layer = out_layer
+
     srs = osr.SpatialReference()
     srs.ImportFromProj4(src.prj4)
 
-    out_path = shp.path[:-4] + '_karst_.shp'
+    out_path = shp.path[:-4] + '__karst.shp'
 
     if os.path.exists(out_path):
         driver.DeleteDataSource(out_path)
 
     out_ds = driver.CreateDataSource(out_path)
-    out_layer = out_ds.CreateLayer('', srs=srs, geom_type=ogr.wkbMultiPolygon)
+    out_layer = out_ds.CreateLayer('FINAL', srs=srs, geom_type=ogr.wkbMultiPolygon)
 
     ogr.Layer.Clip(src_layer, clip_layer, out_layer)
 
     karstshp = dbShp(path=out_path)
+    out_ds = None
     return karstshp
 
 
 def erase(src, diff):
+    #not working currently.
+
     driver = ogr.GetDriverByName("ESRI Shapefile")
     src_ds = driver.Open(src.path, 0)
     src_layer = src_ds.GetLayer()
@@ -401,9 +523,10 @@ def erase(src, diff):
     karstless = dbShp(path=out_path)
     return karstless
 
+
 def dissolve_polygon(raster, shp):
     """
-    Need to work on size management here.
+    Needs work.
 
     :param raster: use karst_raster or any soil raster.  We just need the GT object
     :param shp: shp file to be dissolved
@@ -449,38 +572,94 @@ def dissolve_polygon(raster, shp):
     return flat
 
 
+def deg_lat(shp):
+    in_srs = osr.SpatialReference()
+    in_srs.ImportFromProj4(shp.prj4)
+    out_srs = osr.SpatialReference()
+    out_srs.ImportFromEPSG(4269)
+    coord_transform = osr.CoordinateTransformation(in_srs, out_srs)
+    point = ogr.Geometry(ogr.wkbPoint)
+    point.AddPoint(shp.x_cen, shp.y_cen)
+    point.Transform(coord_transform)
+
+    return point.GetX()
+
+
+def get_area(shp):
+    geom = shp.feature.GetGeometryRef()
+    area = geom.GetArea()
+    return area
+
+
+def characteristics(db_rasters, shp):
+    characteristics_out = {
+        "scaling_parameter" : zonal_stats(db_rasters['scaling_parameter'], shp) / 100,
+        "saturated_hydraulic_conductivity" : zonal_stats(db_rasters['k_sat'], shp) / 100 * 86.4,
+        "saturated_hydraulic_conductivity_multiplier" : zonal_stats(db_rasters['con_mult'], shp) / 100,
+        "soil_depth_total" : zonal_stats(db_rasters["soil_thickness"], shp) / 10,
+        "field_capacity_fraction" : zonal_stats(db_rasters["field_cap"], shp) / 10000,
+        "porosity_fraction" : zonal_stats(db_rasters["porosity"], shp) / 10000,
+        "wilting_point_fraction" : (zonal_stats(db_rasters["field_cap"], shp) / 10000) -
+                                   (zonal_stats(db_rasters['awc'], shp) / 100),
+        "latitude": deg_lat(shp),
+        "basin_area_total": get_area(shp) / 10e6,
+        "impervious_area_fraction": (zonal_area(db_rasters["imp"], shp) / get_area(shp)) * 100,
+        "channel_length_max": 10,
+        "channel_velocity_avg": 0.1,
+        "flow_initial": 0.1,
+        "stream area": zonal_area(db_rasters["imp"], shp) / 10e6,
+        #lake_area: still working,
+        "eff_imp" : 0.7,
+        "imp_delay": 0.1,
+        "twi_adj": 1,  #
+        "et_exp_dorm" : 0,
+        "et_exp_grow" : 0,
+        "grow_trigger" : 15,
+        "rip_area": (zonal_area(db_rasters["imp"], shp) / 10e6), # + lake_area,
+        "lake_delay": 0
+        #up_lake_area : still working
+    }
+
+    df = pd.DataFrame.from_dict(characteristics_out, orient="index")
+    df.index.name = "name"
+    df.columns = ['value']
+
+    return df
+
+
+db_path = "database//"
+db_rasters = {'awc': Raster(path=db_path+'HA00_AWC.tif'),
+              'con_mult': Raster(path=db_path+'HA00_cnmlt.tif'),
+              'field_cap': Raster(path=db_path+'HA00_FC.tif'),
+              'k_sat': Raster(path=db_path+'HA00_Ksat.tif'),
+              'scaling_parameter': Raster(path=db_path+'HA00_m_1.tif'),
+              'soil_thickness': Raster(path=db_path+'HA00_TH.tif'),
+              'porosity': Raster(path=db_path+'HA00_POR.tif'),
+              'imp': Raster(path=db_path+'IMP.tif'),
+              'twi': Raster(path=db_path+"TWI.tif"),
+              'stream': Raster(path=db_path+'snet_10m.tif')
+              }
 
 
 
+# Test code from here on down.
 
-zone_stats = []
-shp = Shp._clean(path="shapefiles//RockCastle.shp")
-karst_raster = Raster(path="database//Sinks.tif")
-karst_shp = Shp(path="shapefiles/sinks2.shp")
+shp = Shp(path="shapefiles//RockCastle.shp")
+grape = Shp(path="shapefiles//GrapeVine.shp")
 
+out_twi = twi_bins(db_rasters['twi'], shp)
+grape_df = characteristics(db_rasters, grape)
+grape_twi = twi_bins(db_rasters['twi'], grape)
+
+karst_raster = Raster(path="database//Sinks_masked.tif")
 shp.karst_flag = karst_detection(karst_raster, shp)
+karst_shp = Shp(path="database/karst_shp.shp")  # this will be replaced as karst.shp.
 
 if shp.karst_flag == 1:
-    karst = clip(karst_shp, shp)
-    karst_new = Shp(path=karst.path)
-    karst_flat = dissolve_polygon(karst_raster, karst_new)
-    karst_f = Shp(path=karst_flat.path)
-    karst_sub = erase(shp, karst_f)
+    simple = simplify(shp)
+    karst = clip(karst_shp, simple)
+
+    # nothing works from here on down.
+    karst_flat = dissolve_polygon(karst_raster, karst)
+    #karst_sub = erase(shp, karst_f)
    # basin_no_karst = Shp(path=karst_sub.path)
-
-for file in os.listdir("database"):
-    if file.startswith("HA00") and file.endswith(".tif"):
-        raster = Raster(path="database//{}".format(file))
-        zonal = zonal_stats(raster, shp)
-        zone_stats.append(zonal)
-
-    elif file.startswith("TWI.tif") and file.endswith(".tif"):
-        raster = Raster(path="database//{}".format(file))
-        twi = twi_bins(raster, shp)
-
-
-
-print("--- %s seconds ---" % (time.time() - start_time))
-print(zone_stats)
-print(twi)
-print(shp.karst_flag)
