@@ -5,6 +5,8 @@ import pandas as pd
 import json
 import pycrs
 import pyproj
+import netCDF4
+import datetime as dt
 
 
 class Shp:
@@ -67,6 +69,8 @@ class dbShp:
         self.lyr = self.shp.GetLayer()
         self.prj = self.shp.GetLayer().GetSpatialRef()
         self.prj4 = self.prj.ExportToProj4()
+        self.feature = self.shp.GetLayer(0).GetFeature(0)
+        self.x_cen, self.y_cen = self._centroid()
 
     def _centroid(self):
         centroid = json.loads(
@@ -476,7 +480,7 @@ def clip(src, shp):
     srs = osr.SpatialReference()
     srs.ImportFromProj4(src.prj4)
 
-    out_path = shp.path[:-4] + '__karst.shp'
+    out_path = shp.path[:-4] + '_karst.shp'
 
     if os.path.exists(out_path):
         driver.DeleteDataSource(out_path)
@@ -485,9 +489,9 @@ def clip(src, shp):
     out_layer = out_ds.CreateLayer('FINAL', srs=srs, geom_type=ogr.wkbMultiPolygon)
 
     ogr.Layer.Clip(src_layer, clip_layer, out_layer)
-
-    karstshp = dbShp(path=out_path)
     out_ds = None
+    karstshp = dbShp(path=out_path)
+
     return karstshp
 
 
@@ -593,73 +597,245 @@ def get_area(shp):
 
 def characteristics(db_rasters, shp):
     characteristics_out = {
-        "scaling_parameter" : zonal_stats(db_rasters['scaling_parameter'], shp) / 100,
-        "saturated_hydraulic_conductivity" : zonal_stats(db_rasters['k_sat'], shp) / 100 * 86.4,
-        "saturated_hydraulic_conductivity_multiplier" : zonal_stats(db_rasters['con_mult'], shp) / 100,
-        "soil_depth_total" : zonal_stats(db_rasters["soil_thickness"], shp) / 10,
-        "field_capacity_fraction" : zonal_stats(db_rasters["field_cap"], shp) / 10000,
-        "porosity_fraction" : zonal_stats(db_rasters["porosity"], shp) / 10000,
-        "wilting_point_fraction" : (zonal_stats(db_rasters["field_cap"], shp) / 10000) -
-                                   (zonal_stats(db_rasters['awc'], shp) / 100),
-        "latitude": deg_lat(shp),
-        "basin_area_total": get_area(shp) / 10e6,
-        "impervious_area_fraction": (zonal_area(db_rasters["imp"], shp) / get_area(shp)) * 100,
-        "channel_length_max": 10,
-        "channel_velocity_avg": 0.1,
-        "flow_initial": 0.1,
-        "stream area": zonal_area(db_rasters["imp"], shp) / 10e6,
-        #lake_area: still working,
-        "eff_imp" : 0.7,
-        "imp_delay": 0.1,
-        "twi_adj": 1,  #
-        "et_exp_dorm" : 0,
-        "et_exp_grow" : 0,
-        "grow_trigger" : 15,
-        "rip_area": (zonal_area(db_rasters["imp"], shp) / 10e6), # + lake_area,
-        "lake_delay": 0
-        #up_lake_area : still working
+        "scaling_parameter": {zonal_stats(db_rasters['scaling_parameter'], shp) / 100
+                              },
+        "saturated_hydraulic_conductivity": {zonal_stats(db_rasters['k_sat'], shp) / 100 * 86.4},
+        "saturated_hydraulic_conductivity_multiplier": {zonal_stats(db_rasters['con_mult'], shp) / 100},
+        "soil_depth_total": {zonal_stats(db_rasters["soil_thickness"], shp) / 10},
+        "field_capacity_fraction": {zonal_stats(db_rasters["field_cap"], shp) / 10000},
+        "porosity_fraction": {zonal_stats(db_rasters["porosity"], shp) / 10000},
+        "wilting_point_fraction": {(zonal_stats(db_rasters["field_cap"], shp) / 10000) -
+                                   (zonal_stats(db_rasters['awc'], shp) / 100)},
+
+        "latitude": {deg_lat(shp)},
+        "basin_area_total": {get_area(shp) / 10e6},
+        "impervious_area_fraction": {(zonal_area(db_rasters["imp"], shp) / get_area(shp)) * 100},
+        "channel_length_max": {2},
+        "channel_velocity_avg": {10},
+        "flow_initial": {0.1},
+        "stream area": {zonal_area(db_rasters["snet_10m"], shp) / 10e5}, # check this one
+        "lake_area": {0}, #still working
+        "up_lake_area" : {0}, #still working
+        "rip_area": {(zonal_area(db_rasters["snet_10m"], shp) / 10e5)},  # stream_area + lake_area,
+        "lake_delay": {0},
+        "eff_imp": {0.7},
+        "imp_delay": {0.1},
+        "twi_adj": {1},
+        "et_exp_dorm": {0},
+        "et_exp_grow": {0},
+        "grow_trigger": {15},
     }
+    units = ["mm", "mm/day","unitless","mm","fraction","fraction","fraction","degrees", "sq km", "percentage",
+             "km", "km/day", "mm/day", "sq km", "sq km", "sq km", "sq km", "days", "fraction", "days", "unitless",
+             "unitless", "unitless", "temp C"]
+
+    description = ['controls the rate of decline of transmissivity in the soil profile',
+                   'saturated hydraulic conductivity of the C horizon of the soil',
+                   'multiplier to apply to saturated hydraulic conductivity ', 'soil depth',
+                   'fraction of soil moisture or water content in the soil after excess water has drained away',
+                   'fraction of soil that is porous and is always larger than field_capacity_fraction',
+                   'fraction amount of the minimal amount of water in the soil that plants require not to wilt',
+                   'centroid latitude of basin', 'total basin area', 'fraction of impervious area of basin',
+                   'maximum channel length', 'average channel velocity', 'initial river flow',
+                   'total stream surface area', 'total waterbody area', 'total waterbody area upstream',
+                   'total riparian area', 'estimated time for water to move through lake',
+                   'percentage of impervious area connection to stream network',
+                   'estimated delay for impervious runoff to reach stream network',
+                   'Adjustment for magnitude of TWI - must be >= 1.',
+                   'evapotranspiration Exponent for non-growing season.',
+                   'evapotranspiration Exponent for growing season.',
+                   'Temperature (C) transition to/from growing season for ET Exp and AMC.']
 
     df = pd.DataFrame.from_dict(characteristics_out, orient="index")
     df.index.name = "name"
     df.columns = ['value']
+    df['units'] = units
+    df['description'] = description
 
     return df
 
 
-db_path = "database//"
-db_rasters = {'awc': Raster(path=db_path+'HA00_AWC.tif'),
-              'con_mult': Raster(path=db_path+'HA00_cnmlt.tif'),
-              'field_cap': Raster(path=db_path+'HA00_FC.tif'),
-              'k_sat': Raster(path=db_path+'HA00_Ksat.tif'),
-              'scaling_parameter': Raster(path=db_path+'HA00_m_1.tif'),
-              'soil_thickness': Raster(path=db_path+'HA00_TH.tif'),
-              'porosity': Raster(path=db_path+'HA00_POR.tif'),
-              'imp': Raster(path=db_path+'IMP.tif'),
-              'twi': Raster(path=db_path+"TWI.tif"),
-              'stream': Raster(path=db_path+'snet_10m.tif')
-              }
+def near(array, value):
+    """
+    array: 2d Array of values taken from daymet NetCDF input file.
+    value: Input value derived from user provided shapefile.
+    idx: Output for actual value nearest to user provided value.
+    """
+
+    # Helper function for build_prcp/build temps.  Finds the actual  nearest x, y coordinate in the matrix
+    # to the user input coordinate.
+    idx = (abs(array - value)).argmin()
+    return idx
+
+
+def build_prcp(f, x, y):
+    """
+    This needs a docstring!
+    """
+
+    # Read in and build the netCDF4 parameters
+    nc = netCDF4.Dataset(f)
+    lat = nc.variables['y'][:]
+    lon = nc.variables['x'][:]
+    time_var = nc.variables['time']
+    dtime = netCDF4.num2date(time_var[:], time_var.units)
+
+    # Building the indexes points.
+    # By default this starts when Daymet starts, though this could be flexible.
+    # Currently, this only accepts Daymet data.
+    start = dt.datetime(1980, 1, 1)
+    end = dt.datetime.utcnow()
+    istart = netCDF4.date2index(start, time_var, select='nearest')
+    istop = netCDF4.date2index(end, time_var, select='nearest')
+    lati = y
+    loni = x
+    ix = near(lon, loni)
+    iy = near(lat, lati)
+
+    # Selecting the variables.
+    prcp = nc.variables['prcp'][:]
+    hs = prcp[0, istart:istop, ix, iy]
+    tim = dtime[istart:istop]
+
+    # Arranging data into pandas df.
+    prcp_ts = pd.Series(hs, index=tim, name='precipitation (mm/day)')
+    prcp_ts = pd.DataFrame(prcp_ts)
+    prcp_ts.reset_index(inplace=True)
+    prcp_ts.columns = ['Index', 'precipitation (mm/day)']
+    prcp_ts['date'] = prcp_ts['Index']
+    prcp_ts.set_index('Index', drop=True, inplace=True)
+
+    return prcp_ts
+
+
+def build_temps(f, x, y):
+    """
+    This also needs a docstring.
+    """
+
+    # Read in and build the netCDF4 parameters
+    nc = netCDF4.Dataset(f)
+    lat = nc.variables['y'][:]
+    lon = nc.variables['x'][:]
+    time_var = nc.variables['time']
+    dtime = netCDF4.num2date(time_var[:], time_var.units)
+
+    # Building the indexes points.
+    # By default this starts when Daymet starts, though this could be flexible.
+    # Currently, this only accepts Daymet data.
+    start = dt.datetime(1980, 1, 1)
+    end = dt.datetime.utcnow()
+    istart = netCDF4.date2index(start, time_var, select='nearest')
+    istop = netCDF4.date2index(end, time_var, select='nearest')
+    lati = y
+    loni = x
+    ix = near(lon, loni)
+    iy = near(lat, lati)
+
+    # Selecting/subsetting the NetCDF dataset.
+    temps = nc.variables['tmax'][:]
+    hs = temps[0, istart:istop, ix, iy]
+    tim = dtime[istart:istop]
+
+    # Arranging data into pandas df.
+    temps_ts = pd.Series(hs, index=tim, name='temperature (celsius)')
+    temps_ts = pd.DataFrame(temps_ts)
+    temps_ts.reset_index(inplace=True)
+    temps_ts.columns = ['Index', 'temperature (celsius)']
+    temps_ts['date'] = temps_ts['Index']
+    temps_ts.set_index('Index', drop=True, inplace=True)
+
+    return temps_ts
+
 
 
 
 # Test code from here on down.
 
-shp = Shp(path="shapefiles//RockCastle.shp")
-grape = Shp(path="shapefiles//GrapeVine.shp")
+# shp = Shp(path="shapefiles//RockCastle.shp")
+# grape = Shp(path="shapefiles//GrapeVine.shp")
+#
+# out_twi = twi_bins(db_rasters['twi'], shp)
+# grape_df = characteristics(db_rasters, grape)
+# grape_twi = twi_bins(db_rasters['twi'], grape)
+#
+# if shp.karst_flag == 1:
+#     simple = simplify(shp)
+#     karst = clip(karst_shp, simple)
 
-out_twi = twi_bins(db_rasters['twi'], shp)
-grape_df = characteristics(db_rasters, grape)
-grape_twi = twi_bins(db_rasters['twi'], grape)
 
-karst_raster = Raster(path="database//Sinks_masked.tif")
-shp.karst_flag = karst_detection(karst_raster, shp)
-karst_shp = Shp(path="database/karst_shp.shp")  # this will be replaced as karst.shp.
+if __name__ == "__main__":
+    # Database header
+    db_path = "database//"
+    karst_raster = Raster(path="database//Sinks_masked.tif")
+    karst_shp = Shp(path="database/karst_shp.shp")
+    db_rasters = {'awc': Raster(path=db_path + 'HA00_AWC.tif'),
+                  'con_mult': Raster(path=db_path + 'HA00_cnmlt.tif'),
+                  'field_cap': Raster(path=db_path + 'HA00_FC.tif'),
+                  'k_sat': Raster(path=db_path + 'HA00_Ksat.tif'),
+                  'scaling_parameter': Raster(path=db_path + 'HA00_m_1.tif'),
+                  'soil_thickness': Raster(path=db_path + 'HA00_TH.tif'),
+                  'porosity': Raster(path=db_path + 'HA00_POR.tif'),
+                  'imp': Raster(path=db_path + 'IMP.tif'),
+                  'snet_10m': Raster(path=db_path + "snet_10m.tif"),
+                  'twi': Raster(path=db_path + "TWI.tif"),
+                  'stream': Raster(path=db_path + 'snet_10m.tif')
+                  }
 
-if shp.karst_flag == 1:
-    simple = simplify(shp)
-    karst = clip(karst_shp, simple)
+
+    # Input goes here.
+    print("path to shapefile:")
+    path_to = input()
+    path_to = str(path_to)
+    print("Create time series? y/n")
+    timeseries = input()
+    if timeseries.capitalize() == "Y":
+        timeseries = True
+    else:
+        timeseries = False
+    shp = Shp(path=path_to)
+
+    shp = Shp(path="shapefiles//grapevine.shp")
+    timeseries = False
+
+    shp.karst_flag = karst_detection(karst_raster, shp)
+    out_df = characteristics(db_rasters, shp)
+    out_twi = twi_bins(db_rasters["twi"], shp)
+
+    # Output
+    out_df.to_csv("input//basin_characteristics.csv")
+    out_twi.to_csv("input//twi.csv")
+    if shp.karst_flag == 1:
+        simple = simplify(shp)
+        karst = clip(karst_shp, simple)
+        out_df_karst = characteristics(db_rasters, karst)
+        out_twi_karst = twi_bins(db_rasters["twi"], karst)
+        out_df_karst.to_csv("input//basin_characteristics_karst.csv")
+        out_twi_karst.to_csv("input//twi_karst.csv")
+
+    if timeseries:
+        for root, dirs, files in os.walk("database//climate", topdown=False):
+            for file in files:
+                file = os.path.join(root, file)
+                if file.endswith("x.nc"):
+                    if not "temp_ts" in globals():
+                        temp_ts = build_temps(file, shp.x_cen, shp.y_cen)
+                    else:
+                        temp_append = build_temps(file, shp.x_cen, shp.y_cen)
+                        temp_ts = temp_ts.append(temp_append)
+                elif file.endswith("p.nc"):
+                    if not "prcp_ts" in globals():
+                        prcp_ts = build_prcp(file, shp.x_cen, shp.y_cen)
+                    else:
+                        prcp_append = build_prcp(file, shp.x_cen, shp.y_cen)
+                        prcp_ts = prcp_ts.append(prcp_append)
+
+        climate_ts = pd.merge(prcp_ts, temp_ts, on="date")
+        col = climate_ts.columns.tolist()
+        col.append(col.pop(0))
+        climate_ts = climate_ts[col]
+        climate_ts.to_csv("input//timeseries.csv")
 
     # nothing works from here on down.
-    karst_flat = dissolve_polygon(karst_raster, karst)
-    #karst_sub = erase(shp, karst_f)
-   # basin_no_karst = Shp(path=karst_sub.path)
+    # karst_flat = dissolve_polygon(karst_raster, karst)
+    # karst_sub = erase(shp, karst_f)

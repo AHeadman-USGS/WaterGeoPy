@@ -14,6 +14,7 @@ def near(array, value):
     idx = (abs(array - value)).argmin()
     return idx
 
+
 def build_prcp(f, x, y):
     """
     This needs a docstring!
