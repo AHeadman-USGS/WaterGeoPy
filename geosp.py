@@ -53,7 +53,7 @@ class Shp:
         return center_x, center_y
 
     def daymet_proj(self):
-        daymet_proj = pycrs.load.from_file("shapefiles//Daymet.prj")
+        daymet_proj = pycrs.load.from_file("database//Daymet.prj")
         transformer = pyproj.Transformer.from_crs(self.prj4, daymet_proj.to_proj4())
         return transformer.transform(self.x_cen, self.y_cen)
 
@@ -80,7 +80,7 @@ class dbShp:
         return center_x, center_y
 
     def daymet_proj(self):
-        daymet_proj = pycrs.load.from_file("shapefiles//Daymet.prj")
+        daymet_proj = pycrs.load.from_file("database//Daymet.prj")
         transformer = pyproj.Transformer.from_crs(self.prj4, daymet_proj.to_proj4())
         return transformer.transform(self.x_cen, self.y_cen)
 
@@ -137,6 +137,7 @@ def karst_detection(raster, shp):
     r_geotransform = raster.gt()
     v_data = shp.shp
     v_feature = v_data.GetLayer(0)
+    nodata_value = r_band.GetNoDataValue()
 
     sourceprj = v_feature.GetSpatialRef()
     targetprj = osr.SpatialReference(wkt=r_data.GetProjection())
@@ -176,7 +177,11 @@ def karst_detection(raster, shp):
     v_to_r_array = v_to_r.ReadAsArray()
     masked = np.ma.MaskedArray(
         src_array,
-        mask=np.logical_not(v_to_r_array)
+        mask=np.logical_or(
+            src_array == nodata_value,
+            np.logical_not(v_to_r_array)
+        ), fill_value=np.nan
+        #mask=np.logical_not(v_to_r_array)
 
     )
 
@@ -395,10 +400,7 @@ def twi_bins(raster, shp, nbins=30):
     edges = np.arange(mn, mx, intvl)
     histo = np.histogram(masked, bins=edges)
 
-
-    # need mean of each bin.  Get the rest of the stats while there.
     # TWI Mean is the value we need for TopModel Input.
-
     bins = []
 
     for i in range(nbins):
@@ -767,7 +769,7 @@ def build_temps(f, x, y):
 if __name__ == "__main__":
     # Database header
     db_path = "database//"
-    karst_raster = Raster(path="database//Sinks_masked.tif")
+    karst_raster = Raster(path="database//Sinks.tif")
     karst_shp = Shp(path="database/karst_shp.shp")
     db_rasters = {'awc': Raster(path=db_path + 'HA00_AWC.tif'),
                   'con_mult': Raster(path=db_path + 'HA00_cnmlt.tif'),
@@ -784,16 +786,16 @@ if __name__ == "__main__":
 
 
     # Input goes here.
-    print("path to shapefile:")
-    path_to = input()
-    path_to = str(path_to)
-    print("Create time series? y/n")
-    timeseries = input()
-    if timeseries.capitalize() == "Y":
-        timeseries = True
-    else:
-        timeseries = False
-    shp = Shp(path=path_to)
+    # print("path to shapefile:")
+    # path_to = input()
+    # path_to = str(path_to)
+    # print("Create time series? y/n")
+    # timeseries = input()
+    # if timeseries.capitalize() == "Y":
+    #     timeseries = True
+    # else:
+    #     timeseries = False
+    # shp = Shp(path=path_to)
 
     shp = Shp(path="shapefiles//grapevine.shp")
     timeseries = False
